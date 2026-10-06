@@ -1,0 +1,49 @@
+name: Yo'llar xaritasi
+
+# Har yakshanba (Toshkent vaqti bilan dushanbaga o'tar kechasi 02:00) va qo'lda ("Run workflow")
+on:
+  schedule:
+    - cron: "0 21 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Kutubxona
+        run: pip install osmium
+
+      - name: OpenStreetMap — O'zbekiston
+        run: curl -fL --retry 5 --retry-delay 30 -o uzbekistan.osm.pbf https://download.geofabrik.de/asia/uzbekistan-latest.osm.pbf
+
+      - name: Grafni yasash
+        run: python build_road_graph.py uzbekistan.osm.pbf uz_roads
+
+      - name: Tekshiruv
+        # Manba buzuq/bo'sh kelsa yarim xaritani telefonlarga tarqatmaslik uchun
+        run: |
+          python - <<'PY'
+          import json, sys
+          meta = json.load(open("uz_roads.json"))
+          print(meta)
+          sys.exit(0 if meta["nodes"] > 500_000 and meta["edges"] > 1_000_000 else "Xarita juda kichik — joylanmadi")
+          PY
+
+      - name: Releases'ga joylash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Avval xarita, keyin json: ilova json'dagi nazorat yig'indisi bilan faylni solishtiradi
+        run: |
+          gh release view map >/dev/null 2>&1 || gh release create map --title "O'zbekiston yo'llar xaritasi" \
+            --notes "Yo'llar grafi — haydovchi ilovasi yo'l bo'yicha masofani telefonning o'zida hisoblashi uchun. Har hafta yangilanadi. Ma'lumot manbai: © OpenStreetMap contributors (ODbL)."
+          gh release upload map uz_roads.bin.gz --clobber
+          gh release upload map uz_roads.json --clobber
