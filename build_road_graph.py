@@ -7,7 +7,7 @@ Kirish:  OpenStreetMap .osm.pbf fayli (masalan Geofabrik uzbekistan-latest.osm.p
 Chiqish: <out>.bin.gz (ilova yuklab oladigan graf) va <out>.json (versiya ma'lumoti)
 
 Masofa uchun keraksiz hamma narsa tashlanadi: faqat avtomobil yo'llari, faqat chorrahalar
-va (yo'lga "yopishish" aniq bo'lishi uchun) har ~250 m da bitta oraliq nuqta qoladi.
+va yo'l shaklini saqlaydigan burilish nuqtalari qoladi (ilova nuqtani eng yaqin yo'l bo'lagiga bog'laydi).
 
 Fayl formati (big-endian, ilovadagi RoadGraphIO.kt bilan bir xil bo'lishi SHART):
     int32  magic = 0x54524732 ("TRG2")
@@ -38,7 +38,8 @@ HIGHWAYS = {
     "living_street", "service", "road",
     "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
 }
-SPACING_M = 250.0        # chorrahalar orasida shundan uzoq bo'lmagan oraliqda nuqta qoldiriladi
+SPACING_M = 1000.0       # to'g'ri yo'lda ham shundan uzoq bo'lmagan oraliqda nuqta qoladi (ilova bo'laklarni yaqin tugunlar orqali topadi)
+SHAPE_TOLERANCE_M = 5.0  # tashlangan nuqtalar to'g'ri kesmadan shundan uzoqlashmasligi kerak (egri yo'l shakli saqlanadi)
 MIN_COMPONENT = 50       # asosiy tarmoqqa ulanmagan mayda bo'laklar tashlanadi
 MAGIC = 0x54524732
 VERSION = 2
@@ -69,6 +70,16 @@ def meters(lat1, lng1, lat2, lng2):
     x = math.radians(o2 - o1) * math.cos(math.radians((a1 + a2) / 2.0))
     y = math.radians(a2 - a1)
     return math.sqrt(x * x + y * y) * EARTH_RADIUS_M
+
+
+def deviation(p, a, b):
+    """p nuqtadan a-b kesmagacha masofa (metr), kirish — (lat_e6, lng_e6)."""
+    k = math.cos(math.radians(p[0] / 1e6))
+    ax, ay = (a[1] - p[1]) * k, a[0] - p[0]
+    dx, dy = (b[1] - p[1]) * k - ax, b[0] - p[0] - ay
+    length_sq = dx * dx + dy * dy
+    t = 0.0 if length_sq == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / length_sq))
+    return math.radians(math.hypot(ax + t * dx, ay + t * dy) / 1e6) * EARTH_RADIUS_M
 
 
 def cell_key(lat_e6, lng_e6):
@@ -103,25 +114,39 @@ def build(pbf_path):
     coords, uses = roads.coords, roads.uses
     print(f"xom: {len(roads.ways)} yo'l, {len(coords)} nuqta", flush=True)
 
-    # Qoladigan tugunlar: yo'l uchlari, chorrahalar (bir necha yo'lda uchraydigan) va har SPACING_M da bitta
+    # Qoladigan tugunlar: yo'l uchlari, chorrahalar (bir necha yo'lda uchraydigan), har SPACING_M da
+    # bitta va yo'l burilgan joylar. Burilishlar shart: ilova nuqtani eng yaqin BO'LAKKA bog'laydi,
+    # egri yo'l uzun to'g'ri kesma bilan almashtirilsa kesma qo'shni (masalan teskari yo'nalishdagi)
+    # qatnov qismi ustidan o'tib, nuqta noto'g'ri yo'lga "yopishadi".
     edges = []  # (from_id, to_id, meters) — yo'naltirilgan
     kept = set()
+
+    def emit(way_dir, a, b, length):
+        kept.add(b)
+        if a != b:
+            if way_dir != REVERSE:
+                edges.append((a, b, length))
+            if way_dir != FORWARD:
+                edges.append((b, a, length))
+
     for way_dir, refs in roads.ways:
         last = refs[0]
         kept.add(last)
-        acc = 0.0
+        acc = 0.0        # last dan hozirgi nuqtagacha yo'l uzunligi
+        skipped = []     # last dan keyin tashlab ketilayotgan nuqtalar
         for i in range(1, len(refs)):
             prev, cur = refs[i - 1], refs[i]
-            acc += meters(*coords[prev], *coords[cur])
+            step = meters(*coords[prev], *coords[cur])
+            # cur gacha to'g'ri kesma tortilsa tashlangan nuqtalar shakldan chiqib ketadimi?
+            if skipped and any(deviation(coords[p], coords[last], coords[cur]) > SHAPE_TOLERANCE_M for p in skipped):
+                emit(way_dir, last, prev, acc)
+                last, acc, skipped = prev, 0.0, []
+            acc += step
             if i == len(refs) - 1 or uses[cur] > 1 or acc >= SPACING_M:
-                kept.add(cur)
-                if cur != last:
-                    if way_dir != REVERSE:
-                        edges.append((last, cur, acc))
-                    if way_dir != FORWARD:
-                        edges.append((cur, last, acc))
-                last = cur
-                acc = 0.0
+                emit(way_dir, last, cur, acc)
+                last, acc, skipped = cur, 0.0, []
+            else:
+                skipped.append(cur)
 
     # Bog'langan qismlar (yo'nalishsiz) — mayda uzilgan bo'laklarni tashlash uchun
     parent = {n: n for n in kept}
